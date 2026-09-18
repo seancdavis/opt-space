@@ -1,4 +1,6 @@
-// Track tab history for "switch to previous tab" feature
+import { cleanUrl } from "./lib/clean-url.js";
+
+// Track tab history for the "previous tab" entry at the top of the palette.
 // Store as map of windowId -> array of tabIds (most recent at end)
 // Uses chrome.storage.session to persist across service worker restarts
 let tabHistoryByWindow = {};
@@ -70,6 +72,12 @@ async function removeFromHistory(tabId, windowId) {
   }
 }
 
+// Most recently used tabs for a window, most recent first, current tab excluded.
+async function recentTabIds(windowId) {
+  await ensureHistoryLoaded();
+  return [...(tabHistoryByWindow[windowId] || [])].reverse();
+}
+
 // Get the previous tab for a specific window
 async function getPreviousTabForWindow(windowId) {
   await ensureHistoryLoaded();
@@ -117,58 +125,214 @@ chrome.runtime.onInstalled.addListener(async () => {
   }
 });
 
+// Native messaging host that toggles the vertical tab sidebar.
+// Chrome exposes no API for the tab strip, so the toggle is delegated to a
+// local script that clicks the button via macOS Accessibility.
+// See host/install.sh for setup.
+const SIDEBAR_HOST = "com.seancdavis.optspace";
+
+async function toggleSidebar() {
+  try {
+    const response = await chrome.runtime.sendNativeMessage(SIDEBAR_HOST, { action: "toggle-sidebar" });
+    // The host answers even when the click didn't happen, so "no error thrown"
+    // is not the same as "the sidebar moved".
+    if (response?.ok === false) {
+      console.error(
+        response.error ||
+        `Sidebar toggle didn't happen. The helper wrote why to ${response.diagnostic}`
+      );
+    }
+  } catch (e) {
+    console.error(
+      "Sidebar toggle failed. Run host/install.sh <extension-id> and grant " +
+      "Chrome Accessibility permission in System Settings.",
+      e
+    );
+  }
+}
+
+// --- The palette -----------------------------------------------------------
+
+// Runs in the page. Everything the palette wants to know that only the page
+// can answer.
+function readPageContext() {
+  const canonical = document.querySelector('link[rel="canonical"]')?.getAttribute("href") || null;
+  const selection = String(window.getSelection() || "").trim();
+  return {
+    canonical,
+    selection: selection.slice(0, 4000),
+    hasForm: !!document.querySelector("form input, form textarea, form select"),
+  };
+}
+
+// Runs in the page. The service worker has no clipboard of its own.
+function writeClipboard(text) {
+  return navigator.clipboard.writeText(text);
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
+
+async function readContext(tabId) {
+  try {
+    const [injected] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: readPageContext,
+    });
+    return injected?.result || {};
+  } catch {
+    // Restricted pages (chrome://, the Web Store, other extensions) never run
+    // our code. The palette still works, it just knows less.
+    return {};
+  }
+}
+
+async function buildItems(tab, page) {
+  const clean = cleanUrl(tab.url, page);
+  const items = [];
+
+  const windowTabs = await chrome.tabs.query({ windowId: tab.windowId });
+  const tabsById = new Map(windowTabs.map((t) => [t.id, t]));
+  const previousTabId = await getPreviousTabForWindow(tab.windowId);
+
+  const tabItem = (t, group, keys) => ({
+    id: "switch-tab",
+    group,
+    title: t.title || t.url,
+    sub: hostOf(t.url),
+    keys,
+    data: { tabId: t.id },
+    keywords: `tab ${t.url}`,
+  });
+
+  if (previousTabId && tabsById.has(previousTabId)) {
+    items.push(tabItem(tabsById.get(previousTabId), "Previous tab", ["↵"]));
+  }
+
+  items.push({
+    id: "copy-clean",
+    group: "This page",
+    title: "Copy link",
+    sub: clean,
+    copy: clean,
+    toast: "Link copied",
+    keys: ["⌃", "⇧", "C"],
+    keywords: "url clean share",
+  });
+
+  if (clean !== tab.url) {
+    items.push({
+      id: "copy-full",
+      group: "This page",
+      title: "Copy full URL",
+      sub: tab.url,
+      copy: tab.url,
+      toast: "Full URL copied",
+      keywords: "url raw original tracking",
+    });
+  }
+
+  const recent = await recentTabIds(tab.windowId);
+  const seen = new Set([tab.id, previousTabId]);
+  const ordered = [
+    ...recent.map((id) => tabsById.get(id)).filter(Boolean),
+    ...windowTabs,
+  ];
+  for (const other of ordered) {
+    if (seen.has(other.id)) continue;
+    seen.add(other.id);
+    items.push(tabItem(other, "Open tabs"));
+  }
+
+  items.push({
+    id: "toggle-sidebar",
+    group: "Browser",
+    title: "Toggle tab sidebar",
+    keys: ["⌃", "S"],
+    keywords: "vertical tabs strip collapse expand",
+  });
+
+  return items;
+}
+
+// Injecting is cheap and the overlay guards against installing itself twice,
+// so this runs on every open rather than tracking which tabs are ready.
+async function ensureOverlay(tabId) {
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["palette/overlay.js"],
+  });
+}
+
+async function openPalette() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) return;
+  try {
+    const page = await readContext(tab.id);
+    const items = await buildItems(tab, page);
+    await ensureOverlay(tab.id);
+    await chrome.tabs.sendMessage(tab.id, { type: "palette:open", items });
+  } catch (e) {
+    console.error("Palette could not open on this page:", e);
+  }
+}
+
+async function copyLink(tab, { full = false } = {}) {
+  const page = await readContext(tab.id);
+  const text = full ? tab.url : cleanUrl(tab.url, page);
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: writeClipboard,
+      args: [text],
+    });
+    await ensureOverlay(tab.id);
+    await chrome.tabs.sendMessage(tab.id, {
+      type: "palette:toast",
+      message: full ? "Full URL copied" : "Link copied",
+    });
+  } catch (e) {
+    console.error("Copy failed on this page:", e);
+  }
+}
+
+// What the palette sends back when you pick something it can't do itself.
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (message?.type !== "palette:run") return;
+  (async () => {
+    try {
+      if (message.id === "switch-tab") {
+        await chrome.tabs.update(message.data.tabId, { active: true });
+      } else if (message.id === "toggle-sidebar") {
+        await toggleSidebar();
+      }
+    } catch (e) {
+      console.error(`Palette action "${message.id}" failed:`, e);
+    }
+  })();
+});
+
 // Handle commands
 chrome.commands.onCommand.addListener(async (command) => {
+  if (command === "open-palette") {
+    await openPalette();
+    return;
+  }
+
   if (command === "copy-url") {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.url) {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: (url) => {
-          navigator.clipboard.writeText(url);
+    if (tab?.url) await copyLink(tab);
+    return;
+  }
 
-          // Remove any existing toast
-          const existing = document.getElementById("copy-url-toast");
-          if (existing) existing.remove();
-
-          // Create toast
-          const toast = document.createElement("div");
-          toast.id = "copy-url-toast";
-          toast.textContent = "URL copied!";
-          toast.style.cssText = `
-            position: fixed;
-            top: 16px;
-            right: 16px;
-            background: #333;
-            color: #fff;
-            padding: 12px 20px;
-            border-radius: 8px;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            font-size: 14px;
-            z-index: 2147483647;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-            opacity: 0;
-            transform: translateY(-10px);
-            transition: opacity 0.2s, transform 0.2s;
-          `;
-          document.body.appendChild(toast);
-
-          // Animate in
-          requestAnimationFrame(() => {
-            toast.style.opacity = "1";
-            toast.style.transform = "translateY(0)";
-          });
-
-          // Animate out and remove
-          setTimeout(() => {
-            toast.style.opacity = "0";
-            toast.style.transform = "translateY(-10px)";
-            setTimeout(() => toast.remove(), 200);
-          }, 2000);
-        },
-        args: [tab.url]
-      });
-    }
+  if (command === "toggle-sidebar") {
+    await toggleSidebar();
+    return;
   }
 
   if (command === "switch-to-previous-tab") {

@@ -1,26 +1,36 @@
 {
   "manifest_version": 3,
-  "name": "Chrome Shortcuts",
-  "version": "1.1",
-  "description": "Custom keyboard shortcuts: Cmd+Shift+C to copy URL, Alt+Space to switch to previous tab",
-  "permissions": ["activeTab", "clipboardWrite", "scripting", "storage", "tabs"],
+  "name": "OptSpace",
+  "version": "2.0",
+  "description": "A command palette for Chrome: one key for your tabs, this page, and handoffs to your own tools",
+  "permissions": ["activeTab", "clipboardWrite", "nativeMessaging", "scripting", "storage", "tabs"],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "commands": {
+    "open-palette": {
+      "suggested_key": {
+        "default": "Alt+Space",
+        "mac": "Alt+Space"
+      },
+      "description": "Open the command palette"
+    },
     "copy-url": {
       "suggested_key": {
         "default": "Ctrl+Shift+C",
         "mac": "MacCtrl+Shift+C"
       },
-      "description": "Copy current URL to clipboard"
+      "description": "Copy a clean link to this page"
+    },
+    "toggle-sidebar": {
+      "suggested_key": {
+        "mac": "MacCtrl+S"
+      },
+      "description": "Toggle vertical tab sidebar (macOS only)"
     },
     "switch-to-previous-tab": {
-      "suggested_key": {
-        "default": "Alt+Space",
-        "mac": "Alt+Space"
-      },
-      "description": "Switch to previously used tab"
+      "description": "Switch to previously used tab (unbound; the palette covers this)"
     }
   }
 }

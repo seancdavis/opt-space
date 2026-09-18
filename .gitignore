@@ -9,3 +9,7 @@
 
 # Packages (if ever added)
 node_modules/
+
+# Built by host/install.sh from helper.applescript. Kept out of git because
+# macOS ties Accessibility permission to the built app on this machine.
+host/OptSpaceHelper.app/
