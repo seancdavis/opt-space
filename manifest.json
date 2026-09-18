@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "OptSpace",
-  "version": "2.0",
+  "version": "0.1",
   "description": "A command palette for Chrome: one key for your tabs, this page, and handoffs to your own tools",
   "permissions": ["activeTab", "clipboardWrite", "nativeMessaging", "scripting", "storage", "tabs"],
   "background": {
